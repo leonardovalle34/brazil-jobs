@@ -5,26 +5,48 @@
 # docs/DATA_SPEC.md §5).
 #
 # This workflow is intentionally thin: it just orchestrates three HTTP
-# calls to a Cloud Run job that holds the actual Python logic in
-# ingestion/caged_ingest.py. Cloud Workflows itself has no Python
-# runtime — the orchestration/execution split is deliberate, matching
-# the pattern already used in production at the owner's day job.
+# calls to a Cloud Run service that holds the actual Python logic in
+# app.py / ingestion/. Cloud Workflows itself has no Python runtime —
+# the orchestration/execution split is deliberate, matching the pattern
+# already used in production at the owner's day job.
 #
-# Each step's URL below is a placeholder for the deployed Cloud Run job
-# endpoint — fill in after the job is deployed.
+# CLOUD_RUN_JOB_URL: https://jobs-in-brazil-pipeline-430812933236.us-central1.run.app
+#
+# Manual override: execute with input {"period": "202508"} to force a
+# specific period (useful for testing or backfilling), instead of
+# always computing "last month" automatically.
 
 main:
   params: [input]
   steps:
+    - init:
+        assign:
+          - service_url: "https://jobs-in-brazil-pipeline-430812933236.us-central1.run.app"
+
+    - check_input_period:
+        switch:
+          - condition: ${"period" in input}
+            assign:
+              - reference_period: ${input.period}
+            next: download_step
+        next: compute_reference_period
+
     - compute_reference_period:
         assign:
-          - current_month: ${text.substring(sys.now_iso8601(), 0, 7)}
-          - reference_period: ${time.format(time.parse(current_month + "-01T00:00:00Z") - 86400, "%Y%m")}
+          - now_iso: ${time.format(sys.now())}
+          - current_month_prefix: ${text.substring(now_iso, 0, 7)}
+          - first_of_month_iso: ${current_month_prefix + "-01T00:00:00Z"}
+          - first_of_month_seconds: ${time.parse(first_of_month_iso)}
+          - prev_month_seconds: ${first_of_month_seconds - 86400}
+          - prev_month_iso: ${time.format(prev_month_seconds)}
+          - prev_month_prefix: ${text.substring(prev_month_iso, 0, 7)}
+          - reference_period: ${text.replace_all(prev_month_prefix, "-", "")}
+        next: download_step
 
     - download_step:
         call: http.post
         args:
-          url: "${CLOUD_RUN_JOB_URL}/download"
+          url: "${service_url}/download"
           auth:
             type: OIDC
           body:
@@ -34,13 +56,13 @@ main:
     - check_download:
         switch:
           - condition: ${download_result.body.status != "ok"}
-            raise: "Download step failed for period " + reference_period
+            raise: '${"Download step failed for period " + reference_period}'
         next: transform_step
 
     - transform_step:
         call: http.post
         args:
-          url: "${CLOUD_RUN_JOB_URL}/transform"
+          url: "${service_url}/transform"
           auth:
             type: OIDC
           body:
@@ -51,13 +73,13 @@ main:
     - check_transform:
         switch:
           - condition: ${transform_result.body.status != "ok"}
-            raise: "Transform step failed for period " + reference_period
+            raise: '${"Transform step failed for period " + reference_period}'
         next: load_step
 
     - load_step:
         call: http.post
         args:
-          url: "${CLOUD_RUN_JOB_URL}/load"
+          url: "${service_url}/load"
           auth:
             type: OIDC
           body:
@@ -68,7 +90,7 @@ main:
     - check_load:
         switch:
           - condition: ${load_result.body.status != "ok"}
-            raise: "Load step failed for period " + reference_period
+            raise: '${"Load step failed for period " + reference_period}'
         next: done
 
     - done:

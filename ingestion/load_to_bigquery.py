@@ -190,33 +190,41 @@ def load_period(client: bigquery.Client, parquet_path: str, state_filter: str = 
     df = df.reset_index(drop=True)
     df["fact_job_id"] = start_id + df.index
 
-    records = df.apply(lambda r: {
-        "fact_job_id": int(r["fact_job_id"]),
-        "time_id": int(r["time_id"]),
-        "ref_date": r["ref_date"].date().isoformat(),
-        "location_id": int(r["location_id"]),
-        "occupation_id": int(r["occupation_id"]),
-        "sector_id": None,
-        "company_size_id": None,
-        "event_type": r["event_type"],
-        "salary": float(r["salary"]) if pd.notna(r["salary"]) else None,
-        "is_typical": None,
-        "gender": r["gender"],
-        "age": int(r["age"]) if pd.notna(r["age"]) else None,
-        "education_level": r["education_level"],
-    }, axis=1).tolist()
-
+    # Build AND insert one chunk at a time — never materialize all rows
+    # as Python dicts simultaneously. An earlier version built the full
+    # list of ~4.3M dicts before inserting anything, which exceeded even
+    # 4GiB of container memory in production. Processing chunk-by-chunk
+    # keeps peak memory bounded by CHUNK_SIZE, not by the total row count.
     CHUNK_SIZE = 500
-    print(f"[load] inserting {len(records)} rows in chunks of {CHUNK_SIZE}")
-    for i in range(0, len(records), CHUNK_SIZE):
-        chunk = records[i:i + CHUNK_SIZE]
-        errors = client.insert_rows_json(f"{DATASET}.fact_jobs", chunk)
+    total_rows = len(df)
+    print(f"[load] inserting {total_rows} rows in chunks of {CHUNK_SIZE}")
+
+    for start in range(0, total_rows, CHUNK_SIZE):
+        chunk_df = df.iloc[start:start + CHUNK_SIZE]
+        chunk_records = chunk_df.apply(lambda r: {
+            "fact_job_id": int(r["fact_job_id"]),
+            "time_id": int(r["time_id"]),
+            "ref_date": r["ref_date"].date().isoformat(),
+            "location_id": int(r["location_id"]),
+            "occupation_id": int(r["occupation_id"]),
+            "sector_id": None,
+            "company_size_id": None,
+            "event_type": r["event_type"],
+            "salary": float(r["salary"]) if pd.notna(r["salary"]) else None,
+            "is_typical": None,
+            "gender": r["gender"],
+            "age": int(r["age"]) if pd.notna(r["age"]) else None,
+            "education_level": r["education_level"],
+        }, axis=1).tolist()
+
+        errors = client.insert_rows_json(f"{DATASET}.fact_jobs", chunk_records)
         if errors:
             raise RuntimeError(f"BigQuery insert errors: {errors}")
-        if (i // CHUNK_SIZE) % 20 == 0:
-            print(f"[load] {min(i + CHUNK_SIZE, len(records))}/{len(records)} rows inserted")
 
-    return len(records)
+        if (start // CHUNK_SIZE) % 20 == 0:
+            print(f"[load] {min(start + CHUNK_SIZE, total_rows)}/{total_rows} rows inserted")
+
+    return total_rows
 
 
 def main():
