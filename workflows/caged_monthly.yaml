@@ -1,0 +1,78 @@
+# Cloud Workflows definition: caged_monthly
+#
+# Triggered monthly by Cloud Scheduler (cron: "0 6 15 * *" — 15th of each
+# month, 6am, giving margin for the government's release delay — see
+# docs/DATA_SPEC.md §5).
+#
+# This workflow is intentionally thin: it just orchestrates three HTTP
+# calls to a Cloud Run job that holds the actual Python logic in
+# ingestion/caged_ingest.py. Cloud Workflows itself has no Python
+# runtime — the orchestration/execution split is deliberate, matching
+# the pattern already used in production at the owner's day job.
+#
+# Each step's URL below is a placeholder for the deployed Cloud Run job
+# endpoint — fill in after the job is deployed.
+
+main:
+  params: [input]
+  steps:
+    - compute_reference_period:
+        assign:
+          - current_month: ${text.substring(sys.now_iso8601(), 0, 7)}
+          - reference_period: ${time.format(time.parse(current_month + "-01T00:00:00Z") - 86400, "%Y%m")}
+
+    - download_step:
+        call: http.post
+        args:
+          url: "${CLOUD_RUN_JOB_URL}/download"
+          auth:
+            type: OIDC
+          body:
+            period: ${reference_period}
+        result: download_result
+
+    - check_download:
+        switch:
+          - condition: ${download_result.body.status != "ok"}
+            raise: "Download step failed for period " + reference_period
+        next: transform_step
+
+    - transform_step:
+        call: http.post
+        args:
+          url: "${CLOUD_RUN_JOB_URL}/transform"
+          auth:
+            type: OIDC
+          body:
+            period: ${reference_period}
+            raw_path: ${download_result.body.raw_path}
+        result: transform_result
+
+    - check_transform:
+        switch:
+          - condition: ${transform_result.body.status != "ok"}
+            raise: "Transform step failed for period " + reference_period
+        next: load_step
+
+    - load_step:
+        call: http.post
+        args:
+          url: "${CLOUD_RUN_JOB_URL}/load"
+          auth:
+            type: OIDC
+          body:
+            period: ${reference_period}
+            fact_path: ${transform_result.body.fact_path}
+        result: load_result
+
+    - check_load:
+        switch:
+          - condition: ${load_result.body.status != "ok"}
+            raise: "Load step failed for period " + reference_period
+        next: done
+
+    - done:
+        return:
+          period: ${reference_period}
+          rows_loaded: ${load_result.body.rows_loaded}
+          status: "ok"

@@ -1,0 +1,10 @@
+pandas>=2.2
+requests>=2.31
+py7zr>=0.21
+google-cloud-bigquery>=3.20
+google-cloud-storage>=2.16
+pyarrow>=16.0
+python-dotenv>=1.0
+pytest>=8.0
+fastapi>=0.110
+uvicorn>=0.29
