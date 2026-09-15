@@ -52,11 +52,17 @@ and test suite locally.
 
 ## Status
 
-Scaffold stage — schema (BigQuery DDL), ingestion logic, the Cloud
-Workflows definition, and a unit test suite are in place and passing.
-Not yet done: `load_to_bigquery.py`, the Cloud Run job the workflow
-calls, the FastAPI layer, the Vue dashboard, and populating
-`dim_occupation` for the full set of CBO codes (see `docs/TECH_SPEC.md`
-§4 for why this is a larger task than an earlier tech-only draft
-anticipated).
+End-to-end pipeline is live and automated: CAGED FTP -> GCS (data lake) ->
+BigQuery (star schema), orchestrated by Cloud Workflows and triggered
+monthly by Cloud Scheduler (15th of each month, 06:00 America/Sao_Paulo).
+Validated against official government releases for four non-consecutive
+months (2025-06, 07, 08, 09) — see `docs/VALIDATION_SPEC.md` for the
+full validation log, including every production issue found and fixed
+along the way (memory limits, IAM permissions, HTTP call timeouts,
+streaming-buffer DML restrictions).
+
+Not yet done: the FastAPI aggregation layer and the Vue dashboard that
+will consume it (see `docs/TECH_SPEC.md` §6 for the planned endpoints),
+and populating `dim_occupation` for the full set of CBO codes beyond
+the auto-seeded placeholders (see `docs/DATA_SPEC.md` §8).
 

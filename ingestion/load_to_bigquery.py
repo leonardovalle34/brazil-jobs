@@ -32,7 +32,7 @@ Usage:
 
 import argparse
 import os
-
+from datetime import datetime, timezone
 import pandas as pd
 from dotenv import load_dotenv
 from google.cloud import bigquery
@@ -198,10 +198,12 @@ def load_period(client: bigquery.Client, parquet_path: str, state_filter: str = 
     CHUNK_SIZE = 500
     total_rows = len(df)
     print(f"[load] inserting {total_rows} rows in chunks of {CHUNK_SIZE}")
+    load_timestamp = datetime.now(timezone.utc).isoformat()
 
     for start in range(0, total_rows, CHUNK_SIZE):
         chunk_df = df.iloc[start:start + CHUNK_SIZE]
         chunk_records = chunk_df.apply(lambda r: {
+            "load_timestamp": load_timestamp,
             "fact_job_id": int(r["fact_job_id"]),
             "time_id": int(r["time_id"]),
             "ref_date": r["ref_date"].date().isoformat(),
