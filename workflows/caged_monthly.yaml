@@ -105,7 +105,7 @@ main:
     - next_period_step:
         call: http.get
         args:
-          url: "${service_url}/next-period"
+          url: '${service_url + "/next-period"}'
           auth:
             type: OIDC
         result: next_result
@@ -185,7 +185,7 @@ process_period:
         try:
           call: http.post
           args:
-            url: "${service_url}/download"
+            url: '${service_url + "/download"}'
             timeout: 1800
             auth:
               type: OIDC
@@ -214,7 +214,7 @@ process_period:
     - transform_step:
         call: http.post
         args:
-          url: "${service_url}/transform"
+          url: '${service_url + "/transform"}'
           timeout: 1800
           auth:
             type: OIDC
@@ -232,7 +232,7 @@ process_period:
     - load_step:
         call: http.post
         args:
-          url: "${service_url}/load"
+          url: '${service_url + "/load"}'
           timeout: 1800
           auth:
             type: OIDC
