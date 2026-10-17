@@ -1,20 +1,39 @@
 # Cloud Workflows definition: caged_monthly
 #
-# Triggered monthly by Cloud Scheduler (cron: "0 6 15 * *" — 15th of each
-# month, 6am, giving margin for the government's release delay — see
-# docs/DATA_SPEC.md §5).
+# Triggered WEEKLY by Cloud Scheduler (trigger "caged-monthly-trigger",
+# cron "0 6 * * 1" — every Monday, 06:00 America/Sao_Paulo). The MTE
+# publishes each CAGED month only near the end of the following month,
+# on no fixed day, so instead of guessing a date the workflow asks the
+# service which month to load next and simply finds nothing to do on
+# most weeks.
 #
-# This workflow is intentionally thin: it just orchestrates three HTTP
-# calls to a Cloud Run service that holds the actual Python logic in
-# app.py / ingestion/. Cloud Workflows itself has no Python runtime —
-# the orchestration/execution split is deliberate, matching the pattern
-# already used in production at the owner's day job.
+# This workflow is intentionally thin: it just orchestrates HTTP calls
+# to a Cloud Run service that holds the actual Python logic in app.py /
+# ingestion/. Cloud Workflows itself has no Python runtime — the
+# orchestration/execution split is deliberate, matching the pattern
+# already used in production at the owner's day job. That includes
+# period detection: it lives in the service (GET /next-period), not here.
 #
 # CLOUD_RUN_JOB_URL: https://jobs-in-brazil-pipeline-430812933236.us-central1.run.app
 #
-# Manual override: execute with input {"period": "202508"} to force a
-# specific period (useful for testing or backfilling), instead of
-# always computing "last month" automatically.
+# Automatic mode (no input, or input without "period"):
+#   loop: GET /next-period -> download -> transform -> load, repeated
+#   until /next-period answers "no_file". /next-period returns the OLDEST
+#   month from 2025-06 up to the current month that is missing from
+#   fact_jobs and already published on the FTP, so one execution first
+#   backfills any gaps and then catches up. Safety limit: MAX_PERIODS
+#   months per execution; the next execution resumes where it stopped.
+#
+# Manual override: execute with input {"period": "202508"} to process
+# only that month (useful for testing or backfilling).
+#
+# "Nothing to do" is a normal outcome, not a failure: the execution ends
+# SUCCEEDED with {"status": "no_file", "message": ..., "loaded": []}.
+# The same applies when /download answers HTTP 404 {"status": "no_file"}
+# (archive not on the FTP yet). Any other error still fails the
+# execution. Results:
+#   {"status": "ok", "loaded": ["202510", "202511", ...]}
+#   {"status": "no_file", "message": "Nenhum mês novo publicado no CAGED", "loaded": []}
 
 main:
   params: [input]
@@ -22,41 +41,173 @@ main:
     - init:
         assign:
           - service_url: "https://jobs-in-brazil-pipeline-430812933236.us-central1.run.app"
+          - max_periods: 12
+          - loaded: []
+          - nothing_new_message: "Nenhum mês novo publicado no CAGED"
 
     - check_input_period:
         switch:
           - condition: ${"period" in input}
-            assign:
-              - reference_period: ${input.period}
-            next: download_step
-        next: compute_reference_period
+            next: manual_run
+        next: check_limit
 
-    - compute_reference_period:
-        assign:
-          - now_iso: ${time.format(sys.now())}
-          - current_month_prefix: ${text.substring(now_iso, 0, 7)}
-          - first_of_month_iso: ${current_month_prefix + "-01T00:00:00Z"}
-          - first_of_month_seconds: ${time.parse(first_of_month_iso)}
-          - prev_month_seconds: ${first_of_month_seconds - 86400}
-          - prev_month_iso: ${time.format(prev_month_seconds)}
-          - prev_month_prefix: ${text.substring(prev_month_iso, 0, 7)}
-          - reference_period: ${text.replace_all(prev_month_prefix, "-", "")}
-        next: download_step
+    # --- Manual override: one given period --------------------------------
 
-    - download_step:
-        call: http.post
+    - manual_run:
+        call: process_period
         args:
-          url: "${service_url}/download"
+          service_url: ${service_url}
+          period: ${input.period}
+        result: outcome
+
+    - manual_result:
+        switch:
+          - condition: ${outcome.status == "no_file"}
+            steps:
+              - log_manual_no_file:
+                  call: sys.log
+                  args:
+                    severity: "WARNING"
+                    text: ${outcome.message}
+              - return_manual_no_file:
+                  return:
+                    status: "no_file"
+                    period: ${input.period}
+                    message: ${outcome.message}
+                    loaded: []
+        next: return_manual_ok
+
+    - return_manual_ok:
+        return:
+          status: "ok"
+          loaded:
+            - ${input.period}
+          rows_loaded: ${outcome.rows_loaded}
+
+    # --- Automatic mode: fill every missing month, then stop --------------
+
+    - check_limit:
+        switch:
+          - condition: ${len(loaded) >= max_periods}
+            steps:
+              - log_limit:
+                  call: sys.log
+                  args:
+                    severity: "WARNING"
+                    text: ${"Limite de " + string(max_periods) + " meses por execução atingido; a próxima execução continua de onde parou"}
+              - return_limit:
+                  return:
+                    status: "ok"
+                    loaded: ${loaded}
+                    message: ${"Limite de " + string(max_periods) + " meses por execução atingido"}
+        next: next_period_step
+
+    - next_period_step:
+        call: http.get
+        args:
+          url: "${service_url}/next-period"
           auth:
             type: OIDC
-          body:
-            period: ${reference_period}
-        result: download_result
+        result: next_result
+
+    - check_next_period:
+        switch:
+          - condition: ${next_result.body.status == "no_file"}
+            next: finish
+          - condition: ${next_result.body.status != "ok"}
+            raise: ${"next-period returned unexpected status " + next_result.body.status}
+          # A month that was just loaded must not come back; if it does,
+          # stop rather than loop on it.
+          - condition: ${next_result.body.period in loaded}
+            raise: ${"next-period returned " + next_result.body.period + " again after loading it"}
+        next: process_next
+
+    - process_next:
+        call: process_period
+        args:
+          service_url: ${service_url}
+          period: ${next_result.body.period}
+        result: outcome
+
+    - check_outcome:
+        switch:
+          # /next-period saw the file but /download did not (e.g. the MTE
+          # pulled it in between): nothing more to do in this execution.
+          - condition: ${outcome.status == "no_file"}
+            next: finish
+        next: record_loaded
+
+    - record_loaded:
+        assign:
+          - loaded: ${list.concat(loaded, next_result.body.period)}
+        next: check_limit
+
+    - finish:
+        switch:
+          - condition: ${len(loaded) == 0}
+            steps:
+              - log_nothing_new:
+                  call: sys.log
+                  args:
+                    severity: "INFO"
+                    text: ${nothing_new_message}
+              - return_nothing_new:
+                  return:
+                    status: "no_file"
+                    message: ${nothing_new_message}
+                    loaded: []
+        next: log_loaded
+
+    - log_loaded:
+        call: sys.log
+        args:
+          severity: "INFO"
+          text: '${"Meses carregados nesta execução: " + json.encode_to_string(loaded)}'
+
+    - return_loaded:
+        return:
+          status: "ok"
+          loaded: ${loaded}
+
+# Runs download -> transform -> load for one period. Returns
+# {"status": "ok", ...} or {"status": "no_file", ...} when /download
+# answers 404; any other failure is raised to the caller.
+process_period:
+  params: [service_url, period]
+  steps:
+    - log_start:
+        call: sys.log
+        args:
+          severity: "INFO"
+          text: ${"Processando período " + period}
+
+    - download_step:
+        try:
+          call: http.post
+          args:
+            url: "${service_url}/download"
+            auth:
+              type: OIDC
+            body:
+              period: ${period}
+          result: download_result
+        except:
+          as: e
+          steps:
+            - check_not_published:
+                switch:
+                  - condition: ${default(map.get(e, "code"), 0) == 404}
+                    return:
+                      status: "no_file"
+                      period: ${period}
+                      message: ${"Arquivo do CAGED para " + period + " ainda não foi publicado"}
+            - reraise_download_error:
+                raise: ${e}
 
     - check_download:
         switch:
           - condition: ${download_result.body.status != "ok"}
-            raise: '${"Download step failed for period " + reference_period}'
+            raise: '${"Download step failed for period " + period}'
         next: transform_step
 
     - transform_step:
@@ -66,14 +217,14 @@ main:
           auth:
             type: OIDC
           body:
-            period: ${reference_period}
+            period: ${period}
             raw_path: ${download_result.body.raw_path}
         result: transform_result
 
     - check_transform:
         switch:
           - condition: ${transform_result.body.status != "ok"}
-            raise: '${"Transform step failed for period " + reference_period}'
+            raise: '${"Transform step failed for period " + period}'
         next: load_step
 
     - load_step:
@@ -83,18 +234,18 @@ main:
           auth:
             type: OIDC
           body:
-            period: ${reference_period}
+            period: ${period}
             fact_path: ${transform_result.body.fact_path}
         result: load_result
 
     - check_load:
         switch:
           - condition: ${load_result.body.status != "ok"}
-            raise: '${"Load step failed for period " + reference_period}'
+            raise: '${"Load step failed for period " + period}'
         next: done
 
     - done:
         return:
-          period: ${reference_period}
-          rows_loaded: ${load_result.body.rows_loaded}
           status: "ok"
+          period: ${period}
+          rows_loaded: ${load_result.body.rows_loaded}

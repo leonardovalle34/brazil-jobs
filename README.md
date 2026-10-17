@@ -31,8 +31,13 @@ Read in this order before touching code:
 [CAGED .7z, monthly] --- raw (parquet, GCS) --- transform --- BigQuery (star schema) --- API (FastAPI) --- Vue 3 + ApexCharts
 ```
 
-Orchestrated by Cloud Workflows, triggered monthly by Cloud Scheduler —
-see `workflows/caged_monthly.yaml`. All services run inside their GCP
+Orchestrated by Cloud Workflows, triggered weekly by Cloud Scheduler —
+see `workflows/caged_monthly.yaml`. The workflow does not guess which
+month to fetch: it asks the pipeline service (`GET /next-period`) for the
+oldest month since 2025-06 that is missing from BigQuery and already
+published on the MTE FTP, loads it, and repeats until nothing is left
+(at most 12 months per execution). Weeks with nothing new end as a
+successful execution with `{"status": "no_file", "loaded": []}`. All services run inside their GCP
 free tier at this project's volume (see `docs/TECH_SPEC.md` §2 for the
 cost breakdown).
 
@@ -54,7 +59,12 @@ and test suite locally.
 
 End-to-end pipeline is live and automated: CAGED FTP -> GCS (data lake) ->
 BigQuery (star schema), orchestrated by Cloud Workflows and triggered
-monthly by Cloud Scheduler (15th of each month, 06:00 America/Sao_Paulo).
+weekly by Cloud Scheduler (every Monday, 06:00 America/Sao_Paulo, cron
+`0 6 * * 1`). The schedule used to be the 15th of each month, computing
+"last month" in the workflow — but the MTE publishes each month only
+near the end of the following one, so those runs failed on a file that
+did not exist yet. Detection now happens in the service (see
+`docs/TECH_SPEC.md` §7).
 Validated against official government releases for four non-consecutive
 months (2025-06, 07, 08, 09) — see `docs/VALIDATION_SPEC.md` for the
 full validation log, including every production issue found and fixed
