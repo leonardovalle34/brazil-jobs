@@ -123,6 +123,20 @@ def resolve_ids_bulk(
 
     return existing
 
+class PeriodAlreadyLoadedError(ValueError):
+    """Raised by the idempotency guard; app.py maps it to HTTP 409."""
+
+
+def get_loaded_periods(client: bigquery.Client) -> set:
+    """I/O: every month (YYYYMM) that already has rows in fact_jobs."""
+    query = f"""
+        SELECT DISTINCT FORMAT_DATE('%Y%m', ref_date) AS period
+        FROM `{DATASET}.fact_jobs`
+        WHERE ref_date IS NOT NULL
+    """
+    return {row["period"] for row in client.query(query).result()}
+
+
 def check_period_not_already_loaded(client: bigquery.Client, ref_date_str: str) -> None:
     """
     Idempotency guard: refuse to load a period that already has fact
@@ -137,7 +151,7 @@ def check_period_not_already_loaded(client: bigquery.Client, ref_date_str: str) 
     result = list(client.query(query).result())
     existing_rows = result[0]["existing_rows"]
     if existing_rows > 0:
-        raise ValueError(
+        raise PeriodAlreadyLoadedError(
             f"Period {ref_date_str} already has {existing_rows} rows in fact_jobs — "
             "refusing to load again to avoid duplicating data. If this period genuinely "
             "needs to be reloaded (e.g. a source correction), drop and recreate the "

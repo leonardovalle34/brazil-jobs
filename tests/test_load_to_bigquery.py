@@ -68,3 +68,27 @@ def test_does_not_raise_when_period_is_new():
     mock_client.query.return_value.result.return_value = mock_result
 
     check_period_not_already_loaded(mock_client, "2025-09-01")
+
+def test_reloading_an_already_loaded_period_inserts_nothing(tmp_path):
+    # End-to-end through load_period: the guard must fire BEFORE any
+    # dimension seeding or fact insert, so a re-run cannot duplicate rows.
+    from load_to_bigquery import load_period, PeriodAlreadyLoadedError
+
+    parquet_path = tmp_path / "fact_caged_202507.parquet"
+    pd.DataFrame({
+        "ref_date": [pd.Timestamp("2025-07-01")],
+        "state_ibge_code": ["42"],
+        "cbo_code": ["317110"],
+        "salary": [5000.0],
+        "event_type": ["admission"],
+        "gender": ["1"],
+        "age": [30],
+        "education_level": ["7"],
+    }).to_parquet(parquet_path, index=False)
+
+    mock_client = MagicMock()
+    mock_client.query.return_value.result.return_value = [{"existing_rows": 4373105}]
+
+    with pytest.raises(PeriodAlreadyLoadedError):
+        load_period(mock_client, str(parquet_path))
+    mock_client.insert_rows_json.assert_not_called()
